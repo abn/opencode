@@ -17,6 +17,8 @@ import {
 } from "@modelcontextprotocol/sdk/types.js"
 import { Config } from "@/config/config"
 import { ConfigMCPV1 } from "@opencode-ai/core/v1/config/mcp"
+import { Global } from "@opencode-ai/core/global"
+import { PluginDiscovery } from "@/agent-plugins/discovery"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { withTimeout } from "@/util/timeout"
@@ -414,6 +416,8 @@ const layer = Layer.effect(
       }),
     )
     const cfgSvc = yield* Config.Service
+    const global = yield* Global.Service
+    const fs = yield* FSUtil.Service
 
     const descendants = Effect.fnUntraced(
       function* (pid: number) {
@@ -493,7 +497,16 @@ const layer = Layer.effect(
       Effect.fn("MCP.state")(function* () {
         const cfg = yield* cfgSvc.get()
         const bridge = yield* EffectBridge.make()
-        const config = cfg.mcp ?? {}
+        // Agent Plugins packages contribute servers under "<plugin>-<server>"
+        // names, with user config winning on collision.
+        const discovered = yield* PluginDiscovery.loadMcp(
+          fs,
+          yield* cfgSvc.directories(),
+          path.join(global.data, "agent-plugins"),
+          new Set(Object.keys(cfg.mcp ?? {})),
+        )
+        yield* PluginDiscovery.logIssues([...discovered.errors, ...discovered.warnings])
+        const config = { ...discovered.servers, ...cfg.mcp }
         const s: State = {
           config: {},
           status: {},
@@ -501,6 +514,11 @@ const layer = Layer.effect(
           defs: {},
           instructions: {},
         }
+        // Plugin servers live in state config so status, connect, auth, and
+        // timeout flows treat them like user servers. User servers stay out of
+        // s.config: those flows read them from config directly, while
+        // getMcpConfig checks s.config first, so the two sources never collide.
+        for (const [key, server] of Object.entries(discovered.servers)) s.config[key] = server
 
         yield* Effect.forEach(
           Object.entries(config),
@@ -998,7 +1016,15 @@ export type AuthStatus = "authenticated" | "expired" | "not_authenticated"
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [CrossSpawnSpawner.node, McpAuth.node, EventV2Bridge.node, Config.node, McpBrowser.node],
+  deps: [
+    CrossSpawnSpawner.node,
+    McpAuth.node,
+    EventV2Bridge.node,
+    Config.node,
+    McpBrowser.node,
+    FSUtil.node,
+    Global.node,
+  ],
 })
 
 export * as MCP from "."
