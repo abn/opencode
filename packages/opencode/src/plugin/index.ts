@@ -1,4 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import path from "node:path"
 import type {
   Hooks,
   PluginInput,
@@ -7,6 +8,11 @@ import type {
   WorkspaceAdapter as PluginWorkspaceAdapter,
 } from "@opencode-ai/plugin"
 import { Config } from "@/config/config"
+import { Global } from "@opencode-ai/core/global"
+import { FSUtil } from "@opencode-ai/core/fs-util"
+import { PluginDiscovery } from "@/agent-plugins/discovery"
+import { ShellHooks } from "@/agent-plugins/shell-hooks"
+import { pathToFileURL } from "node:url"
 import { createOpencodeClient } from "@opencode-ai/sdk"
 import { ServerAuth } from "@/server/auth"
 import { CodexAuthPlugin } from "./openai/codex"
@@ -22,7 +28,7 @@ import { DigitalOceanAuthPlugin } from "./digitalocean"
 import { XaiAuthPlugin } from "./xai"
 import { CerebrasPlugin } from "./cerebras"
 import { SnowflakeCortexAuthPlugin } from "./snowflake-cortex"
-import { Effect, Layer, Context } from "effect"
+import { Effect, Layer, Option, Context } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { errorMessage } from "@/util/error"
@@ -111,10 +117,20 @@ function getLegacyPlugins(mod: Record<string, unknown>) {
   return result
 }
 
-async function applyPlugin(load: PluginLoader.Loaded, input: PluginInput, hooks: Hooks[]) {
+async function applyPlugin(load: PluginLoader.Loaded, input: PluginInput, hooks: Hooks[], fallbackId?: string) {
   const plugin = readV1Plugin(load.mod, load.spec, "server", "detect")
   if (plugin) {
-    await resolvePluginId(load.source, load.spec, load.target, readPluginId(plugin.id, load.spec), load.pkg)
+    // Directory packages carry their portable identity in plugin.json, so a
+    // missing or malformed module id falls back to the manifest name instead
+    // of failing. npm packages keep strict id validation.
+    let id: string | undefined
+    try {
+      id = readPluginId(plugin.id, load.spec) ?? fallbackId
+    } catch (error) {
+      if (!fallbackId) throw error
+      id = fallbackId
+    }
+    await resolvePluginId(load.source, load.spec, load.target, id, load.pkg)
     hooks.push(await (plugin as PluginModule).server(input, load.options))
     return
   }
@@ -130,6 +146,8 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const config = yield* Config.Service
     const flags = yield* RuntimeFlags.Service
+    const global = yield* Global.Service
+    const fs = yield* FSUtil.Service
 
     const state = yield* InstanceState.make<State>(
       Effect.fn("Plugin.state")(function* (ctx) {
@@ -241,6 +259,75 @@ const layer = Layer.effect(
           )
         }
 
+        // Agent Plugins directory packages expose lifecycle hooks through an
+        // ai.opencode/ entry. Each entry loads in isolation so one broken
+        // package never blocks the rest, and every entry sees the config
+        // notification below like any other plugin.
+        const extensions = yield* PluginDiscovery.loadExtensions(
+          fs,
+          yield* config.directories(),
+          path.join(global.data, "agent-plugins"),
+        )
+        for (const issue of [...extensions.errors, ...extensions.warnings]) {
+          yield* Effect.logWarning("agent plugin issue", { path: issue.path, message: issue.message })
+        }
+        for (const ext of extensions.extensions) {
+          // The JS entry and the shell hooks load independently: neither may
+          // gate the other, so a broken entry never silences sibling observers.
+          if (ext.extension.entry) {
+            const entry = pathToFileURL(ext.extension.entry).href
+            const mod = yield* Effect.tryPromise({
+              try: () => import(entry),
+              catch: errorMessage,
+            }).pipe(
+              Effect.tapError((error) =>
+                Effect.logError("failed to load agent plugin", { plugin: ext.name, error }),
+              ),
+              Effect.option,
+            )
+            if (Option.isNone(mod)) {
+              publishPluginError(`Failed to load agent plugin ${ext.name}: entry could not be imported`)
+            } else {
+              const load: PluginLoader.Loaded = {
+                spec: `agent-plugins/${ext.name}`,
+                options: {
+                  ...ext.extension.options,
+                  plugin_root: ext.root,
+                  plugin_data: ext.extension.dataDir,
+                },
+                deprecated: false,
+                source: "file",
+                target: ext.root,
+                entry,
+                mod: Option.getOrThrow(mod) as Record<string, unknown>,
+              }
+              yield* Effect.tryPromise({
+                try: () => applyPlugin(load, input, hooks, ext.name),
+                catch: (err) => errorMessage(err),
+              }).pipe(
+                Effect.tapError((error) =>
+                  Effect.logError("failed to load agent plugin", { plugin: ext.name, error }),
+                ),
+                Effect.catch(() => Effect.void),
+              )
+            }
+          }
+          // Shell hooks observe tool calls from the same package. They need
+          // no JS entry, so they load independently of the block above.
+          const shell = yield* ShellHooks.loadFile(
+            fs,
+            ext.extension.dir,
+            { root: ext.root, data: ext.extension.dataDir },
+            ext.name,
+          )
+          if (shell) {
+            for (const issue of shell.warnings) {
+              yield* Effect.logWarning("agent plugin issue", { path: issue.path, message: issue.message })
+            }
+            if (shell.hooks) hooks.push(shell.hooks)
+          }
+        }
+
         // Notify plugins of current config
         for (const hook of hooks) {
           yield* Effect.tryPromise({
@@ -312,7 +399,7 @@ const layer = Layer.effect(
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [EventV2Bridge.node, Config.node, RuntimeFlags.node],
+  deps: [EventV2Bridge.node, Config.node, RuntimeFlags.node, FSUtil.node, Global.node],
 })
 
 export * as Plugin from "."

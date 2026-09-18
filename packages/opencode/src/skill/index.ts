@@ -15,6 +15,7 @@ import { ConfigMarkdown } from "@/config/markdown"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Glob } from "@opencode-ai/core/util/glob"
 import { Discovery } from "./discovery"
+import { PluginDiscovery } from "@/agent-plugins/discovery"
 import { isRecord } from "@/util/record"
 import { escapeHtml } from "@/util/html"
 
@@ -122,12 +123,17 @@ const add = Effect.fnUntraced(function* (state: State, match: string, events: Ev
 
   if (!isSkillFrontmatter(md.data)) return
 
-  if (state.skills[md.data.name]) {
+  const existing = state.skills[md.data.name]
+  // Plugin skills never override a same-named user skill. Loads run with
+  // unbounded concurrency, so resolution must be precedence-aware rather than
+  // relying on match order: user > plugin, and within a class last-wins.
+  if (existing) {
     yield* Effect.logWarning("duplicate skill name", {
       name: md.data.name,
-      existing: state.skills[md.data.name].location,
+      existing: existing.location,
       duplicate: match,
     })
+    if (isPluginSkill(match) && !isPluginSkill(existing.location)) return
   }
 
   state.dirs.add(path.dirname(match))
@@ -138,6 +144,14 @@ const add = Effect.fnUntraced(function* (state: State, match: string, events: Ev
     content: md.content,
   }
 })
+
+// Agent Plugins skills live under an agent-plugins/ directory; every other
+// skill is treated as a user skill with higher precedence. A user directory
+// coincidentally named agent-plugins/ is treated the same way, which only
+// demotes it against other user skills of the same name.
+function isPluginSkill(location: string): boolean {
+  return location.split(path.sep).includes("agent-plugins")
+}
 
 const scan = Effect.fnUntraced(function* (
   state: ScanState,
@@ -203,6 +217,19 @@ const discoverSkills = Effect.fnUntraced(function* (
   }
 
   const configDirs = yield* config.directories()
+
+  // Agent Plugins packages live in agent-plugins/ inside every config
+  // directory. Plugin skills load before user skills so a same-named user
+  // skill wins: built-in < plugins < user dirs < explicit paths < urls.
+  // Each discovered skill directory holds exactly one SKILL.md.
+  const plugins = yield* PluginDiscovery.loadSkills(fsys, configDirs, path.join(global.data, "agent-plugins"))
+  for (const issue of [...plugins.errors, ...plugins.warnings]) {
+    yield* Effect.logWarning("agent plugin issue", { path: issue.path, message: issue.message })
+  }
+  for (const skill of plugins.skills) {
+    yield* scan(state, skill.dir, "SKILL.md")
+  }
+
   for (const dir of configDirs) {
     yield* scan(state, dir, OPENCODE_SKILL_PATTERN)
   }

@@ -122,6 +122,54 @@ Instructions here.
     ),
   )
 
+  it.live("lets user skills override plugin skills", () =>
+    provideTmpdirInstance(
+      (dir) =>
+        withHome(
+          dir,
+          Effect.gen(function* () {
+            yield* Effect.promise(() =>
+              Bun.write(
+                path.join(dir, ".opencode", "skill", "dup", "SKILL.md"),
+                `---
+name: dup
+description: User skill.
+---
+
+User wins.
+`,
+              ),
+            )
+            yield* Effect.promise(() =>
+              Bun.write(
+                path.join(dir, ".opencode", "agent-plugins", "demo", "plugin.json"),
+                JSON.stringify({ $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json", name: "demo" }),
+              ),
+            )
+            yield* Effect.promise(() =>
+              Bun.write(
+                path.join(dir, ".opencode", "agent-plugins", "demo", "skills", "dup", "SKILL.md"),
+                `---
+name: dup
+description: Plugin skill.
+---
+
+Plugin loses.
+`,
+              ),
+            )
+
+            const skill = yield* Skill.Service
+            const item = (yield* skill.all()).find((s) => s.name === "dup")
+            expect(item).toBeDefined()
+            expect(item!.description).toBe("User skill.")
+            expect(item!.location).toContain(path.join("skill", "dup", "SKILL.md"))
+          }),
+        ),
+      { git: true },
+    ),
+  )
+
   it.live("returns skill directories from Skill.dirs", () =>
     provideTmpdirInstance(
       (dir) =>

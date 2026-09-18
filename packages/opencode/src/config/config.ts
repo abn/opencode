@@ -28,6 +28,7 @@ import { ConfigPermissionV1 } from "@opencode-ai/core/v1/config/permission"
 import { ConfigPluginV1 } from "@opencode-ai/core/v1/config/plugin"
 import { ConfigAgent } from "./agent"
 import { ConfigCommand } from "./command"
+import { PluginDiscovery } from "@/agent-plugins/discovery"
 import { ConfigManaged } from "./managed"
 import { ConfigParse } from "./parse"
 import { ConfigPaths } from "./paths"
@@ -367,6 +368,62 @@ const layer = Layer.effect(
           return mergePluginOrigins(source, next.plugin, kind)
         }
 
+        // Agents and commands contributed by Agent Plugins directory packages.
+        // Local entries win on name collision; one broken package never fails
+        // config, it is skipped with a warning. Scans every config directory
+        // at once so plugin-name shadowing (project overrides global) is
+        // resolved exactly as it is for skills, MCP servers, and hooks, and
+        // must be invoked once after the merge loop, not per directory.
+        const loadPluginExtension = Effect.fnUntraced(function* () {
+          const found = yield* PluginDiscovery.loadExtensions(
+            fs,
+            directories,
+            path.join(Global.Path.data, "agent-plugins"),
+          )
+          for (const issue of [...found.errors, ...found.warnings]) {
+            yield* Effect.logWarning("agent plugin issue", { path: issue.path, message: issue.message })
+          }
+          for (const ext of found.extensions) {
+            result.command ??= {}
+            yield* loadPluginEntries(ext, "commands", result.command, (dir) => ConfigCommand.load(dir))
+            result.agent ??= {}
+            yield* loadPluginEntries(ext, "agents", result.agent, (dir) => ConfigAgent.load(dir))
+            yield* loadPluginEntries(ext, "modes", result.agent, (dir) => ConfigAgent.loadMode(dir))
+          }
+        })
+
+        // One entry kind from one extension package. A malformed file drops
+        // that package's entries of that kind with the underlying reason;
+        // sibling kinds and packages keep loading. Local entries win on name
+        // collision.
+        const loadPluginEntries = Effect.fnUntraced(function* <T>(
+          ext: { name: string; extension: { dir: string } },
+          kind: string,
+          map: Record<string, T>,
+          load: (dir: string) => Promise<Record<string, T>>,
+        ) {
+          const entries = yield* Effect.tryPromise({
+            try: () => load(ext.extension.dir),
+            catch: (error) => error,
+          }).pipe(
+            Effect.catch((error) =>
+              Effect.logWarning("agent plugin entries skipped", {
+                plugin: ext.name,
+                kind,
+                error: error instanceof Error ? error.message : String(error),
+              }).pipe(Effect.as(undefined)),
+            ),
+          )
+          if (!entries) return
+          for (const [name, entry] of Object.entries(entries)) {
+            if (map[name]) {
+              yield* Effect.logWarning("agent plugin entry skipped", { plugin: ext.name, kind, name })
+              continue
+            }
+            map[name] = entry
+          }
+        })
+
         for (const [key, value] of Object.entries(auth)) {
           if (value.type === "wellknown") {
             const url = key.replace(/\/+$/, "")
@@ -478,6 +535,8 @@ const layer = Layer.effect(
           const list = yield* Effect.promise(() => ConfigPlugin.load(dir))
           yield* mergePluginOrigins(dir, list)
         }
+
+        yield* loadPluginExtension()
 
         if (process.env.OPENCODE_CONFIG_CONTENT) {
           const source = "OPENCODE_CONFIG_CONTENT"
