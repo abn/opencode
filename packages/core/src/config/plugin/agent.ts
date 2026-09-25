@@ -4,8 +4,10 @@ import { define } from "@opencode/plugin/effect/plugin"
 import { Document, Info, type Entry } from "@opencode/schema/config"
 import { ConfigAgent } from "@opencode/schema/config/agent"
 import path from "path"
-import { Effect, Option, PubSub, Schema, Stream } from "effect"
+import { Effect, Option, PubSub, Schema, Semaphore, Stream } from "effect"
 import { Agent } from "../../agent.js"
+import { AgentPlugins } from "../../agent-plugins/discovery.js"
+import { AgentPluginsService } from "../../agent-plugins/service.js"
 import { Config } from "../../config.js"
 import { ConfigMarkdown } from "../markdown.js"
 import { FSUtil } from "@opencode/util/fs-util"
@@ -38,6 +40,7 @@ export const Plugin = define({
     const config = yield* Config.Service
     const fs = yield* FSUtil.Service
     const global = yield* Global.Service
+    const shared = yield* AgentPluginsService.Service
     const loadEntry = Effect.fnUntraced(function* (entry: Entry) {
       if (entry.type === "document") return [entry]
       if (entry.type !== "directory") return []
@@ -50,12 +53,39 @@ export const Plugin = define({
       ).pipe(Effect.map((documents) => documents.filter((document): document is Document => document !== undefined)))
     })
     const load = Effect.fn("ConfigAgentPlugin.load")(function* () {
-      return yield* Effect.forEach(yield* config.entries(), loadEntry).pipe(Effect.map((documents) => documents.flat()))
+      const entries = yield* config.entries()
+      // Agent Plugins extensions contribute agents and modes from ai.opencode/.
+      // Plugin documents sort before local documents so local entries win the
+      // merge on name collision. The file list comes from discovery, which
+      // resolved and contained each path; the config glob is not reused here.
+      yield* shared.refresh()
+      const { extensions } = yield* shared.extensions()
+      const pluginDocuments = yield* Effect.forEach(extensions, (ext) =>
+        Effect.gen(function* () {
+          const documents: Array<Document> = []
+          for (const group of ext.extension.markdown) {
+            if (group.dir !== "agents" && group.dir !== "modes") continue
+            for (const filepath of group.files) {
+              const content = yield* fs.readFileStringSafe(filepath).pipe(Effect.orElseSucceed(() => undefined))
+              if (!content) continue
+              const document = yield* decode({ directory: ext.extension.dir, filepath, primary: group.dir === "modes" }, content)
+              if (document) documents.push(document)
+            }
+          }
+          return documents
+        }),
+      )
+      const local = yield* Effect.forEach(entries, loadEntry)
+      return [...pluginDocuments.flat(), ...local.flat()]
     })
     const loaded = { documents: [] as Document[] }
+    const lock = Semaphore.makeUnsafe(1)
+    // Serialize the whole load-then-commit sequence: two trigger fibers
+    // interleaving would let an older scan commit after a newer one.
     const reload = load().pipe(
       Effect.tap((documents) => Effect.sync(() => (loaded.documents = documents))),
       Effect.andThen(ctx.agent.reload()),
+      (effect) => lock.withPermit(effect),
     )
     // One trigger feed serializes reloads and shares one debounce window;
     // subscribing before the initial scan means updates racing the scan still
@@ -72,10 +102,16 @@ export const Plugin = define({
     yield* ctx.event
       .subscribe({ types: ["config.updated"] })
       .pipe(Stream.runForEach(notify), Effect.forkScoped({ startImmediately: true }))
+    yield* shared.changes().pipe(
+      Stream.runForEach(notify),
+      Effect.forkScoped({ startImmediately: true }),
+    )
     const updates = yield* PubSub.subscribe(changes)
     yield* Stream.fromSubscription(updates).pipe(
       Stream.debounce("100 millis"),
-      Stream.runForEach(() => reload),
+      Stream.runForEach(() =>
+        reload.pipe(Effect.catchCause((cause) => Effect.logError("failed to reload agents", { cause }))),
+      ),
       Effect.forkScoped({ startImmediately: true }),
     )
     loaded.documents = yield* load()
@@ -133,7 +169,9 @@ function isAgentSource(entries: Entry[], file: string) {
   return entries.some(
     (entry) =>
       entry.type === "directory" &&
-      sourceDirectories.some((name) => FSUtil.contains(path.join(entry.path, name), file)),
+      (sourceDirectories.some((name) => FSUtil.contains(path.join(entry.path, name), file)) ||
+        FSUtil.contains(path.join(entry.path, AgentPlugins.PLUGIN_DIR), file) ||
+        AgentPlugins.isSharedPath(file)),
   )
 }
 

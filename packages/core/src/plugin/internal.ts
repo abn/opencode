@@ -14,7 +14,9 @@ import { Command } from "../command.js"
 import { Config } from "../config.js"
 import { Credential } from "../credential.js"
 import { llmClient } from "../effect/app-node-platform.js"
+import { AgentPluginsService } from "../agent-plugins/service.js"
 import { ConfigAgentPlugin } from "../config/plugin/agent.js"
+import { ConfigAgentPluginsPlugin } from "../config/plugin/agent-plugins.js"
 import { ConfigCommandPlugin } from "../config/plugin/command.js"
 import { ConfigCompactionPlugin } from "../config/plugin/compaction.js"
 import { ConfigFormatterPlugin } from "../config/plugin/formatter.js"
@@ -132,6 +134,7 @@ const services = [
   Location.Service,
   ModelsDev.Service,
   Mcp.Service,
+  AgentPluginsService.Service,
   Npm.Service,
   Permission.Service,
   Form.Service,
@@ -203,6 +206,7 @@ export const requirements = LayerNode.group([
   SkillDiscovery.node,
   Tool.node,
   ToolOutput.node,
+  AgentPluginsService.node,
   Watcher.node,
   WellKnown.node,
   Worktree.node,
@@ -263,6 +267,7 @@ const post = [
   ConfigToolOutputPlugin.Plugin,
   ConfigCompatibilityPlugin.Plugin,
   ConfigSkillPlugin.Plugin,
+  ConfigAgentPluginsPlugin.Plugin,
   ConfigProviderPlugin.Plugin,
   ConfigWebSearchPlugin.Plugin,
   ConfigPolicyPlugin.Plugin,

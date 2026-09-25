@@ -6,6 +6,7 @@ import { Credential } from "@opencode/core/credential"
 import { Database } from "@opencode/core/database/database"
 import { FileAccess } from "@opencode/core/file-access"
 import { LayerNodePlatform } from "@opencode/util/effect/app-node-platform"
+import { AgentPluginsService } from "@opencode/core/agent-plugins/service"
 import { AppProcess } from "@opencode/util/process"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { Bus } from "@opencode/core/bus"
@@ -80,6 +81,7 @@ const permissionLayer = Layer.succeed(
 export const makePluginTestLayer = (permission = permissionLayer) =>
   AppNodeBuilder.build(
     LayerNode.group([
+      AgentPluginsService.node,
       AppProcess.node,
       FileSystem.node,
       FSUtil.node,

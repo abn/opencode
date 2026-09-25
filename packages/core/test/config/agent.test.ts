@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
-import { Effect, Fiber, Schema, Stream } from "effect"
+import { Effect, Fiber, Layer, Schema, Stream } from "effect"
 import { Agent } from "@opencode/core/agent"
 import { Bus } from "@opencode/core/bus"
 import { Config } from "@opencode/core/config"
@@ -12,6 +12,7 @@ import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { FSUtil } from "@opencode/util/fs-util"
 import { Global } from "@opencode/util/global"
+import { Location } from "@opencode/core/location"
 import { Permission } from "@opencode/core/permission"
 import { AgentPlugin } from "@opencode/core/plugin/agent"
 import { AbsolutePath } from "@opencode/core/schema"
@@ -21,8 +22,26 @@ import { advance, drain } from "../lib/clock"
 import { tmpdir, tmpdirScoped } from "../fixture/tmpdir"
 import { testEffect } from "../lib/effect"
 import { agentHost, host } from "../plugin/host"
+import { tempGlobalLayer } from "../fixture/global"
+import { tempLocationLayer } from "../fixture/location"
+import { Watcher } from "@opencode/core/filesystem/watcher"
+import { emptyAgentPlugins } from "../agent-plugins/fixture"
 
-const it = testEffect(AppNodeBuilder.build(LayerNode.group([Agent.node, Bus.node, FSUtil.node, Global.node])))
+const it = testEffect(
+  Layer.mergeAll(
+    AppNodeBuilder.build(
+      LayerNode.group([Agent.node, Bus.node, FSUtil.node, Global.node, Location.node, Watcher.node]),
+      [
+        // Isolated home and location so shared ecosystem roots resolve to tmp
+        // directories instead of the developer's real ones.
+        Global.node.replace(tempGlobalLayer),
+        Location.node.replace(tempLocationLayer),
+        Watcher.node.replace(Watcher.testLayer),
+      ],
+    ),
+    emptyAgentPlugins,
+  ),
+)
 const decode = Schema.decodeUnknownSync(Info)
 
 function migrateV1(input: unknown) {

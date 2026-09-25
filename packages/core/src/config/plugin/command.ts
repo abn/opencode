@@ -5,16 +5,18 @@ import { Info, type Entry } from "@opencode/schema/config"
 import { ConfigCommand } from "@opencode/schema/config/command"
 import { AppProcess } from "@opencode/util/process"
 import path from "path"
-import { Effect, Option, PubSub, Schema, Stream } from "effect"
+import { Effect, Option, PubSub, Schema, Semaphore, Stream } from "effect"
 import { ChildProcess } from "effect/process"
 import { Agent } from "../../agent.js"
+import { AgentPlugins } from "../../agent-plugins/discovery.js"
+import { AgentPluginsService } from "../../agent-plugins/service.js"
 import { Config } from "../../config.js"
-import { Location } from "../../location.js"
 import { Session } from "../../session.js"
 import { SubagentJob } from "../../session/subagent-job.js"
 import { ShellSelect } from "../../shell/select.js"
 import { FSUtil } from "@opencode/util/fs-util"
 import { ConfigMarkdown } from "../markdown.js"
+import { Location } from "../../location.js"
 
 const decodeCommand = Schema.decodeUnknownOption(ConfigCommand.Info)
 
@@ -23,6 +25,7 @@ export const Plugin = define({
   effect: Effect.fn(function* (ctx) {
     const config = yield* Config.Service
     const fs = yield* FSUtil.Service
+    const shared = yield* AgentPluginsService.Service
     const loadEntry = Effect.fnUntraced(function* (entry: Entry) {
       if (entry.type === "document") return [{ commands: entry.info.commands }]
       if (entry.type !== "directory") return []
@@ -36,12 +39,35 @@ export const Plugin = define({
     const agents = yield* Agent.Service
     const subagents = yield* SubagentJob.Service
     const load = Effect.fn("ConfigCommandPlugin.load")(function* () {
-      return yield* Effect.forEach(yield* config.entries(), loadEntry).pipe(Effect.map((documents) => documents.flat()))
+      const entries = yield* config.entries()
+      // Agent Plugins extensions contribute commands from ai.opencode/.
+      // Plugin documents sort before local documents so local entries win on
+      // name collision.
+      yield* shared.refresh()
+      const { extensions } = yield* shared.extensions()
+      // Discovery resolved and contained each markdown path; the config glob
+      // is not reused for package content because it follows symlinks.
+      const pluginCommands: Array<{ commands: Info["commands"] }> = yield* Effect.forEach(extensions, (ext) =>
+        Effect.gen(function* () {
+          const loaded: Array<{ name: string; info: ConfigCommand.Info }> = []
+          for (const group of ext.extension.markdown) {
+            if (group.dir !== "commands") continue
+            loaded.push(...(yield* loadContained(fs, ext.extension.dir, group.files)))
+          }
+          return { commands: Object.fromEntries(loaded.map((command) => [command.name, command.info])) }
+        }),
+      )
+      const local = yield* Effect.forEach(entries, loadEntry)
+      return [...pluginCommands, ...local.flat()]
     })
     const loaded = { documents: [] as { commands: Info["commands"] }[] }
+    const lock = Semaphore.makeUnsafe(1)
+    // Serialize the whole load-then-commit sequence: two trigger fibers
+    // interleaving would let an older scan commit after a newer one.
     const reload = load().pipe(
       Effect.tap((documents) => Effect.sync(() => (loaded.documents = documents))),
       Effect.andThen(ctx.command.reload()),
+      (effect) => lock.withPermit(effect),
     )
     // One trigger feed serializes reloads and shares one debounce window;
     // subscribing before the initial scan means updates racing the scan still
@@ -58,10 +84,16 @@ export const Plugin = define({
     yield* ctx.event
       .subscribe({ types: ["config.updated"] })
       .pipe(Stream.runForEach(notify), Effect.forkScoped({ startImmediately: true }))
+    yield* shared.changes().pipe(
+      Stream.runForEach(notify),
+      Effect.forkScoped({ startImmediately: true }),
+    )
     const updates = yield* PubSub.subscribe(changes)
     yield* Stream.fromSubscription(updates).pipe(
       Stream.debounce("100 millis"),
-      Stream.runForEach(() => reload),
+      Stream.runForEach(() =>
+        reload.pipe(Effect.catchCause((cause) => Effect.logError("failed to reload commands", { cause }))),
+      ),
       Effect.forkScoped({ startImmediately: true }),
     )
     loaded.documents = yield* load()
@@ -143,26 +175,34 @@ function isCommandSource(entries: Entry[], file: string) {
   return entries.some(
     (entry) =>
       entry.type === "directory" &&
-      sourceDirectories.some((name) => FSUtil.contains(path.join(entry.path, name), file)),
+      (sourceDirectories.some((name) => FSUtil.contains(path.join(entry.path, name), file)) ||
+        FSUtil.contains(path.join(entry.path, AgentPlugins.PLUGIN_DIR), file) ||
+        AgentPlugins.isSharedPath(file)),
   )
 }
 
 function loadDirectory(fs: FSUtil.Interface, directory: string) {
-  return Effect.gen(function* () {
-    const files = yield* fs
-      .scan("{command,commands}/**/*.md", { cwd: directory, absolute: true, dot: true, symlink: true })
-      .pipe(Effect.orElseSucceed(() => [] as string[]))
-    return yield* Effect.forEach(files.toSorted(), (filepath) =>
-      fs.readFileStringSafe(filepath).pipe(
-        Effect.map((content) => (content === undefined ? undefined : decode(directory, filepath, content))),
-        Effect.orElseSucceed(() => undefined),
-      ),
-    ).pipe(
-      Effect.map((commands) =>
-        commands.filter((command): command is { name: string; info: ConfigCommand.Info } => command !== undefined),
-      ),
+  return fs
+    .scan("{command,commands}/**/*.md", { cwd: directory, absolute: true, dot: true, symlink: true })
+    .pipe(
+      Effect.orElseSucceed(() => [] as string[]),
+      Effect.flatMap((files) => loadContained(fs, directory, files.toSorted())),
     )
-  })
+}
+
+// Read already-contained plugin markdown. discovery resolved every path
+// against the plugin root, so the files are read at the paths it approved.
+function loadContained(fs: FSUtil.Interface, directory: string, files: readonly string[]) {
+  return Effect.forEach(files, (filepath) =>
+    fs.readFileStringSafe(filepath).pipe(
+      Effect.map((content) => (content === undefined ? undefined : decode(directory, filepath, content))),
+      Effect.orElseSucceed(() => undefined),
+    ),
+  ).pipe(
+    Effect.map((commands) =>
+      commands.filter((command): command is { name: string; info: ConfigCommand.Info } => command !== undefined),
+    ),
+  )
 }
 
 function decode(directory: string, filepath: string, content: string) {

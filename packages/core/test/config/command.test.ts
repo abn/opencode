@@ -32,6 +32,7 @@ import { emptyConfigLayer, emptyMcpLayer, testLocationLayer } from "../fixture/m
 import { location } from "../fixture/location"
 import { tmpdir } from "../fixture/tmpdir"
 import { tempGlobalLayer } from "../fixture/global"
+import { emptyAgentPlugins } from "../agent-plugins/fixture"
 import { offlineModels } from "../fixture/models"
 import { testEffect } from "../lib/effect"
 import { host } from "../plugin/host"
@@ -46,7 +47,8 @@ const shellLayer = Layer.succeed(
 )
 
 const it = testEffect(
-  AppNodeBuilder.build(
+  Layer.mergeAll(
+    AppNodeBuilder.build(
     LayerNode.group([
       Command.node,
       Bus.node,
@@ -58,6 +60,8 @@ const it = testEffect(
       Job.node,
       SubagentJob.node,
       Agent.node,
+      Global.node,
+      Watcher.node,
     ]),
     [
       Mcp.node.replace(emptyMcpLayer),
@@ -66,8 +70,11 @@ const it = testEffect(
       ShellSelect.node.replace(shellLayer),
       Global.node.replace(tempGlobalLayer),
       SessionExecution.node.replace(SessionExecution.noopLayer),
+      Watcher.node.replace(Watcher.testLayer),
       offlineModels,
     ],
+    ),
+    emptyAgentPlugins,
   ),
 )
 const decode = Schema.decodeUnknownSync(Info)

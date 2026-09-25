@@ -7,6 +7,7 @@ import { Global } from "@opencode/util/global"
 import path from "path"
 import { Effect, FiberMap, PubSub, Semaphore, Stream } from "effect"
 import { Config } from "../../config.js"
+import { AgentPluginsService } from "../../agent-plugins/service.js"
 import { Watcher } from "../../filesystem/watcher.js"
 import { Location } from "../../location.js"
 import { AbsolutePath } from "../../schema.js"
@@ -26,6 +27,7 @@ export const Plugin = define({
     const global = yield* Global.Service
     const location = yield* Location.Service
     const watcher = yield* Watcher.Service
+    const shared = yield* AgentPluginsService.Service
     const loaded: { entries: Entry[]; skills: Skill.Info[] } = {
       entries: yield* config.entries(),
       skills: [],
@@ -149,8 +151,21 @@ export const Plugin = define({
     const refresh = Effect.fn("ConfigSkillPlugin.refresh")(
       function* (file?: string) {
         yield* FiberMap.clear(watches)
+        yield* shared.refresh()
         const skills = new Map<Skill.ID, Skill.Info>()
         const current = sources()
+        // Agent Plugins packages contribute skills discovery already resolved
+        // and contained, one SKILL.md per skill. Registering those directly
+        // keeps this consumer from rescanning a package, which would follow
+        // nested and symlinked files discovery never approved. Plugin skills
+        // load before user sources, so a same-named user skill wins.
+        const { skills: pluginSkills } = yield* shared.skills()
+        for (const entry of pluginSkills) {
+          const content = yield* fs.readFileStringSafe(entry.file).pipe(Effect.orElseSucceed(() => undefined))
+          if (!content) continue
+          const parsed = SkillFile.parse(entry.dir, entry.file, content)
+          if (parsed._tag === "Parsed") skills.set(parsed.skill.id, parsed.skill)
+        }
         for (const source of current) {
           for (const skill of yield* load(source)) skills.set(skill.id, skill)
         }
@@ -171,7 +186,18 @@ export const Plugin = define({
     const updates = yield* PubSub.subscribe(changes)
     yield* Stream.fromSubscription(updates).pipe(
       Stream.debounce("100 millis"),
-      Stream.runForEach((file) => refresh(file).pipe(Effect.andThen(ctx.skill.reload()))),
+      Stream.runForEach((file) =>
+        refresh(file).pipe(
+          Effect.andThen(ctx.skill.reload()),
+          Effect.catchCause((cause) => Effect.logError("failed to reload skills", { cause })),
+        ),
+      ),
+      Effect.forkScoped({ startImmediately: true }),
+    )
+    // Container updates from the shared service (new or removed plugin
+    // packages) rescan skills through the same debounced chain.
+    yield* shared.changes().pipe(
+      Stream.runForEach(() => PubSub.publish(changes, "container").pipe(Effect.asVoid)),
       Effect.forkScoped({ startImmediately: true }),
     )
     yield* refresh()
@@ -184,6 +210,7 @@ export const Plugin = define({
           Effect.tap((entries) => Effect.sync(() => (loaded.entries = entries))),
           Effect.andThen(refresh()),
           Effect.andThen(ctx.skill.reload()),
+          Effect.catchCause((cause) => Effect.logError("failed to reload skills", { cause })),
         ),
       ),
       Effect.forkScoped({ startImmediately: true }),

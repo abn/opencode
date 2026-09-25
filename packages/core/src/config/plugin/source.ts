@@ -3,12 +3,15 @@ export * as ConfigPluginSource from "./source.js"
 import { Directory, Document, type Entry } from "@opencode/schema/config"
 import { ConfigPlugin } from "@opencode/schema/config/plugin"
 import { FSUtil } from "@opencode/util/fs-util"
+import { Global } from "@opencode/util/global"
 import { Host } from "@opencode/plugin/host"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { Context, Effect, Layer, Option, PubSub, Scope, Stream } from "effect"
 import path from "path"
 import { fileURLToPath, pathToFileURL } from "url"
 import { Config } from "../../config.js"
+import { AgentPlugins } from "../../agent-plugins/discovery.js"
+import { AgentPluginsService } from "../../agent-plugins/service.js"
 import { Watcher } from "../../filesystem/watcher.js"
 import { Location } from "../../location.js"
 import { PluginSourceDirectory } from "../../plugin/source-directory.js"
@@ -19,6 +22,9 @@ export type Operation =
       readonly target: string
       readonly options: Record<string, unknown>
       readonly mtime?: number
+      // Portable identity for directory packages whose module omits its own
+      // id; sources without one keep strict id validation.
+      readonly fallbackId?: string
     }
   | {
       readonly type: "remove"
@@ -38,6 +44,7 @@ export const layer = Layer.effect(
     const config = yield* Config.Service
     const watcher = yield* Watcher.Service
     const fs = yield* FSUtil.Service
+    const shared = yield* AgentPluginsService.Service
     const location = yield* Location.Service
     const configuredChanges = yield* PubSub.unbounded<void>()
     const watched = new Set<string>()
@@ -74,19 +81,44 @@ export const layer = Layer.effect(
     return Service.of({
       operations: Effect.fn("ConfigPluginSource.operations")(function* () {
         const entries = yield* config.entries()
-        const operations = yield* scan(fs, location, entries)
+        yield* shared.refresh()
+        const { extensions } = yield* shared.extensions()
+        const operations = yield* scan(
+          fs,
+          location,
+          entries,
+          extensions.flatMap((ext) =>
+            ext.extension.entry
+              ? [
+                  {
+                    type: "add" as const,
+                    target: ext.extension.entry,
+                    options: {
+                      ...ext.extension.options,
+                      plugin_root: ext.root,
+                      plugin_data: ext.extension.dataDir,
+                    },
+                    fallbackId: ext.name,
+                  },
+                ]
+              : [],
+          ),
+        )
         yield* watchConfiguredSources(entries, operations)
         return operations
       }),
       changes: () =>
         Stream.merge(
-          config.changes().pipe(
-            Stream.filterEffect((update) =>
-              Effect.map(config.entries(), (entries) => isPluginSource(entries, update.path)),
+          Stream.merge(
+            config.changes().pipe(
+              Stream.filterEffect((update) =>
+                Effect.map(config.entries(), (entries) => isPluginSource(entries, update.path)),
+              ),
+              Stream.map(() => undefined),
             ),
-            Stream.map(() => undefined),
+            Stream.fromPubSub(configuredChanges),
           ),
-          Stream.fromPubSub(configuredChanges),
+          shared.changes().pipe(Stream.map(() => undefined)),
         ),
     })
   }),
@@ -95,7 +127,7 @@ export const layer = Layer.effect(
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [Config.node, FSUtil.node, Watcher.node, Location.node],
+  deps: [Config.node, FSUtil.node, Watcher.node, Location.node, Global.node, AgentPluginsService.node],
 })
 
 export const empty = makeLocationNode({
@@ -123,6 +155,7 @@ const scan = Effect.fn("ConfigPluginSource.scan")(function* (
   fs: FSUtil.Interface,
   location: Location.Interface,
   entries: readonly Entry[],
+  agentPlugins: Array<Extract<Operation, { type: "add" }>>,
 ) {
   const discovered = yield* Effect.forEach(
     entries.filter((entry): entry is Directory => entry.type === "directory"),
@@ -156,7 +189,9 @@ const scan = Effect.fn("ConfigPluginSource.scan")(function* (
     }),
   ).pipe(Effect.map((operations) => operations.flatMap(Option.toArray)))
   // Explicit config is applied last so it can remove auto-discovered packages.
-  return yield* Effect.forEach([...discovered, ...resolved], (operation) =>
+  // Agent Plugins entries sort with the other auto-discovered packages so
+  // explicit removals apply to them too.
+  return yield* Effect.forEach([...discovered, ...agentPlugins, ...resolved], (operation) =>
     Effect.gen(function* () {
       if (operation.type === "remove" || !path.isAbsolute(operation.target)) return [operation]
       if (!(yield* fs.existsSafe(operation.target))) return [operation]
@@ -194,6 +229,9 @@ function isPluginSource(entries: readonly Entry[], file: string) {
   return entries.some(
     (entry) =>
       entry.type === "directory" &&
-      PluginSourceDirectory.names.some((directory) => FSUtil.contains(path.join(entry.path, directory), file)),
+      (PluginSourceDirectory.names.some((directory) => FSUtil.contains(path.join(entry.path, directory), file)) ||
+        FSUtil.contains(path.join(entry.path, AgentPlugins.PLUGIN_DIR), file) ||
+        AgentPlugins.isSharedPath(file)),
   )
 }
+

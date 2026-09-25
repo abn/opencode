@@ -10,7 +10,7 @@ import {
   Server,
   WebStandardStreamableHTTPServerTransport,
 } from "@modelcontextprotocol/server"
-import { Document, Event, Info } from "@opencode/schema/config"
+import { Directory, Document, Event, Info } from "@opencode/schema/config"
 import { ConfigMCP } from "@opencode/schema/config/mcp"
 import { McpEvent } from "@opencode/schema/mcp-event"
 import { ConfigPolicy } from "@opencode/schema/config/policy"
@@ -26,6 +26,10 @@ import { Integration } from "@opencode/core/integration"
 import { Environment } from "@opencode/core/environment/index"
 import { EnvironmentUnavailable } from "@opencode/core/environment/unavailable"
 import { Location } from "@opencode/core/location"
+import { AgentPluginsService } from "@opencode/core/agent-plugins/service"
+import { FSUtil } from "@opencode/util/fs-util"
+import { Watcher } from "@opencode/core/filesystem/watcher"
+import { tempGlobalLayer } from "./fixture/global"
 import { Mcp } from "@opencode/core/mcp/index"
 import { McpClient } from "@opencode/core/mcp/client"
 import { McpStdio } from "@opencode/core/mcp/stdio"
@@ -63,7 +67,7 @@ import { testEffect } from "./lib/effect"
 import { registerIntegrationPolicy, setOrganizationPolicy } from "./fixture/policy"
 import { imagePassthrough } from "./lib/image"
 import { location } from "./fixture/location"
-import { tmpdirScoped } from "./fixture/tmpdir"
+import { tmpdirScoped, withTempDir } from "./fixture/tmpdir"
 import { hostEnvironmentLayer, recordingEnvironmentLayer } from "./fixture/environment"
 import {
   codeModeListings,
@@ -305,6 +309,31 @@ function resourceMcpLayer(
 ) {
   const directory = AbsolutePath.make(import.meta.dir)
   const unusedIntegration = () => Effect.die("unused integration service")
+  const configLayer = overrides?.entries
+    ? Layer.succeed(
+        Config.Service,
+        Config.Service.of({
+          entries: overrides.entries,
+          changes: () => Stream.never,
+        }),
+      )
+    : Config.testLayer([
+        new Document({
+          type: "document",
+          info: new Info({
+            policies: overrides?.policies ?? [],
+            mcp: new ConfigMCP.Info({
+              servers: {
+                resources:
+                  typeof server === "string"
+                    ? new ConfigMCP.Remote({ type: "remote", url: server, oauth: false })
+                    : server,
+              },
+            }),
+          }),
+        }),
+      ])
+  const locationLayer = Layer.succeed(Location.Service, Location.Service.of(location({ directory })))
   return Layer.effectDiscard(
     Effect.gen(function* () {
       const bus = yield* Bus.Service
@@ -321,31 +350,16 @@ function resourceMcpLayer(
     Layer.provideMerge(Form.layer),
     Layer.provide(
       Layer.mergeAll(
-        overrides?.entries
-          ? Layer.succeed(
-              Config.Service,
-              Config.Service.of({
-                entries: overrides.entries,
-                changes: () => Stream.never,
-              }),
-            )
-          : Config.testLayer([
-              new Document({
-                type: "document",
-                info: new Info({
-                  policies: overrides?.policies ?? [],
-                  mcp: new ConfigMCP.Info({
-                    servers: {
-                      resources:
-                        typeof server === "string"
-                          ? new ConfigMCP.Remote({ type: "remote", url: server, oauth: false })
-                          : server,
-                    },
-                  }),
-                }),
-              }),
-            ]),
-        Layer.succeed(Location.Service, Location.Service.of(location({ directory }))),
+        configLayer,
+        locationLayer,
+        // Agent Plugins discovery binds to the same config/location stand-ins
+        // the MCP config register reads.
+        AppNodeBuilder.build(AgentPluginsService.node, [
+          Config.node.replace(configLayer),
+          Location.node.replace(locationLayer),
+          Watcher.node.replace(Watcher.testLayer),
+          Global.node.replace(tempGlobalLayer),
+        ]),
         Layer.mock(Bus.Service, {
           subscribe: overrides?.subscribe ?? (() => Stream.never),
           publish: (definition, data) => {
@@ -384,6 +398,8 @@ function resourceMcpLayer(
           },
         }),
         Layer.mock(Credential.Service, {}),
+        LayerNode.compile(FSUtil.node),
+        tempGlobalLayer,
         overrides?.environment ?? hostEnvironmentLayer,
       ),
     ),
@@ -2825,3 +2841,73 @@ for (const source of ["config", "organization"] as const) {
       }),
   )
 }
+
+describe("agent-plugins.mcp", () => {
+  test("registers discovered servers with user config winning", async () => {
+    await withTempDir((tmp) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          fs.mkdir(path.join(tmp.path, "agent-plugins", "demo"), { recursive: true }).then(() =>
+            fs.writeFile(
+              path.join(tmp.path, "agent-plugins", "demo", "plugin.json"),
+              JSON.stringify({
+                $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+                name: "demo",
+              }),
+            ),
+          ).then(() =>
+            fs.writeFile(
+              path.join(tmp.path, "agent-plugins", "demo", "mcp.json"),
+              JSON.stringify({
+                $schema: "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+                mcpServers: {
+                  local: { type: "stdio", command: "./bin/srv" },
+                  remote: { type: "streamable-http", url: "http://localhost:9/mcp" },
+                },
+              }),
+            ),
+          ).then(() =>
+            fs.mkdir(path.join(tmp.path, "agent-plugins", "demo", "bin"), { recursive: true }).then(() =>
+              fs.writeFile(path.join(tmp.path, "agent-plugins", "demo", "bin", "srv"), "#!/bin/sh\nexit 0\n"),
+            ),
+          ),
+        )
+        const entries = [
+          new Document({
+            type: "document",
+            info: new Info({
+              mcp: new ConfigMCP.Info({
+                servers: {
+                  "demo-remote": new ConfigMCP.Remote({
+                    type: "remote",
+                    url: "https://user.example/mcp",
+                    oauth: false,
+                  }),
+                },
+              }),
+            }),
+          }),
+          new Directory({ type: "directory", path: AbsolutePath.make(tmp.path) }),
+        ]
+        yield* Effect.gen(function* () {
+          const service = yield* Mcp.Service
+          yield* service.transform((editor) => {
+            const local = editor.get("demo-local")
+            expect(local?.type).toBe("local")
+            if (local?.type === "local") expect(local.command[0]).toContain(path.join("bin", "srv"))
+            const remote = editor.get("demo-remote")
+            expect(remote?.type).toBe("remote")
+            if (remote?.type === "remote") expect(remote.url).toBe("https://user.example/mcp")
+          }).pipe(Effect.asVoid)
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(
+            resourceMcpLayer(new ConfigMCP.Local({ type: "local", command: ["unused"], disabled: true }), undefined, undefined, {
+              entries: () => Effect.succeed(entries),
+            }),
+          ),
+        )
+      }),
+    )
+  })
+})

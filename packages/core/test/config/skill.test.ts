@@ -23,6 +23,7 @@ import { WellKnown } from "@opencode/core/wellknown"
 import { emptyCredentialNode, emptyWellknownNode } from "../fixture/config-nodes"
 import { advance, drain } from "../lib/clock"
 import { tmpdir } from "../fixture/tmpdir"
+import { emptyAgentPlugins } from "../agent-plugins/fixture"
 import { location } from "../fixture/location"
 import { testEffect } from "../lib/effect"
 import { host } from "../plugin/host"
@@ -30,7 +31,11 @@ import { host } from "../plugin/host"
 const emptyDiscovery = SkillDiscovery.Service.of({ pull: () => Effect.succeed([]) })
 const watcherLayer = Watcher.testLayer
 const it = testEffect(
-  Layer.merge(AppNodeBuilder.build(LayerNode.group([Skill.node, Bus.node, FSUtil.node])), watcherLayer),
+  Layer.mergeAll(
+    AppNodeBuilder.build(LayerNode.group([Skill.node, Bus.node, FSUtil.node])),
+    watcherLayer,
+    emptyAgentPlugins,
+  ),
 )
 const decode = Schema.decodeUnknownSync(Info)
 

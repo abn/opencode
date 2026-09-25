@@ -98,6 +98,22 @@ export class LoadError extends Schema.TaggedError<LoadError>()("PluginModule.Loa
   cause: Schema.optional(Schema.Defect()),
 }) {}
 
+// Directory packages carry their portable identity in plugin.json, so an
+// operation may name a fallback id used when the module omits its own or
+// sets a malformed one. Operations without a fallback keep strict validation.
+function withFallbackId(module: unknown, fallbackId: string | undefined): unknown {
+  if (fallbackId === undefined || !isRecord(module)) return module
+  const definition = module["default"]
+  if (!isRecord(definition)) return module
+  const id = definition["id"]
+  if (typeof id === "string" && id.length > 0) return module
+  return { ...module, default: { ...definition, id: fallbackId } }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
 const load = Effect.fn("PluginModule.load")(function* (
   operation: Extract<ConfigPluginSource.Operation, { type: "add" }>,
   sources: ReturnType<typeof createPluginSources>,
@@ -126,7 +142,7 @@ const load = Effect.fn("PluginModule.load")(function* (
   // A package with only a GUI part (and maybe a TUI part) has nothing to run here: its id is its package name, and its
   // other parts load from this listing.
   const server = entrypoint
-    ? yield* loadServer(entrypoint, local ? sources : undefined, installed?.revision)
+    ? yield* loadServer(entrypoint, local ? sources : undefined, installed?.revision, operation.fallbackId)
     : undefined
   const plugin = server?.plugin ?? {
     id: Host.packageID(installed ?? { directory: operation.target }),
@@ -176,11 +192,12 @@ const loadServer = Effect.fn("PluginModule.loadServer")(function* (
   entrypoint: string,
   sources: ReturnType<typeof createPluginSources> | undefined,
   revision: string | undefined,
+  fallbackId: string | undefined,
 ) {
   const loaded = yield* Effect.promise(() =>
     sources ? sources.read(entrypoint) : Host.load(entrypoint).then((module) => ({ module, version: revision })),
   )
-  const value = (yield* Schema.decodeUnknownEffect(Module)(loaded.module).pipe(
+  const value = (yield* Schema.decodeUnknownEffect(Module)(withFallbackId(loaded.module, fallbackId)).pipe(
     Effect.mapError(
       (cause) =>
         new LoadError({
